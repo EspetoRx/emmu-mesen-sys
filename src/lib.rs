@@ -118,6 +118,37 @@ pub const GBA_ADJUST_COLORS_OFFSET: usize = 995;
 pub const GBA_CHANNEL_VOLUMES_OFFSET: usize = 1024;
 pub const GBA_CHANNEL_COUNT: usize = 6;
 
+/// Tamanho de `GameboyConfig` na ABI do MesenCE (confirmado com `offsetof`).
+pub const GAMEBOY_CONFIG_SIZE: usize = 2084;
+
+/// Cópia opaca de `GameboyConfig`. Alinhamento 4, igual ao da estrutura C++.
+#[repr(C, align(4))]
+pub struct GameboyConfigAbi {
+    pub bytes: [u8; GAMEBOY_CONFIG_SIZE],
+}
+
+/// `offsetof(GameboyConfig, Controller.Type)` / `LinkedController.Type`.
+pub const GAMEBOY_PORT1_TYPE_OFFSET: usize = 988;
+pub const GAMEBOY_PORT2_TYPE_OFFSET: usize = 1980;
+/// `ControllerType::GameboyController` na enum do MesenCE.
+pub const CONTROLLER_TYPE_GAMEBOY_CONTROLLER: u32 = 42;
+
+/// Defaults C++ de `GameboyConfig` que precisam ser reaplicados porque a ABI
+/// não exporta `GetGameboyConfig` e montamos a estrutura zerada.
+pub const GAMEBOY_MODEL_OFFSET: usize = 1984;
+pub const GAMEBOY_USE_SGB2_OFFSET: usize = 1988;
+pub const GAMEBOY_BLEND_FRAMES_OFFSET: usize = 2000;
+pub const GAMEBOY_ADJUST_COLORS_OFFSET: usize = 2001;
+pub const GAMEBOY_RAM_POWER_ON_STATE_OFFSET: usize = 2008;
+pub const GAMEBOY_BG_COLORS_OFFSET: usize = 2020;
+pub const GAMEBOY_OBJ0_COLORS_OFFSET: usize = 2036;
+pub const GAMEBOY_OBJ1_COLORS_OFFSET: usize = 2052;
+pub const GAMEBOY_CHANNEL_VOLUMES_OFFSET: usize = 2068;
+pub const GAMEBOY_CHANNEL_COUNT: usize = 4;
+/// `GameboyModel::AutoFavorGbc`: executa carts CGB como CGB e carts DMG no
+/// modo de compatibilidade colorido pelo boot ROM do CGB.
+pub const GAMEBOY_MODEL_AUTO_FAVOR_GBC: u32 = 1;
+
 /// Parâmetro de `ExecuteShortcut` — `EmulatorShortcut::Reset` na ABI do MesenCE.
 #[repr(C)]
 pub struct ExecuteShortcutParams {
@@ -169,6 +200,7 @@ extern "C" {
     pub fn SetNesConfig(config: NesConfigAbi);
     pub fn SetSnesConfig(config: SnesConfigAbi);
     pub fn SetGbaConfig(config: GbaConfigAbi);
+    pub fn SetGameboyConfig(config: GameboyConfigAbi);
     pub fn ExecuteShortcut(params: ExecuteShortcutParams);
     pub fn SetAudioConfig(config: AudioConfigAbi);
     pub fn SaveStateFile(filepath: *mut c_char);
@@ -391,6 +423,55 @@ pub fn connect_gba_controllers() {
     }
 
     unsafe { SetGbaConfig(config) };
+}
+
+/// Configura controle, modelo e volumes de Game Boy / Game Boy Color para uma
+/// instância headless. Chamado antes de `LoadRom`, porque o MesenCE cria os
+/// control devices apenas uma vez durante o carregamento da ROM.
+pub fn connect_gameboy_controllers() {
+    if is_shutting_down() {
+        return;
+    }
+    // A ABI não exporta GetGameboyConfig, então reconstruímos a estrutura.
+    // Campos deixados em zero já têm o valor padrão do C++ (link cable desligado,
+    // RamState::Random, sem overlays, overclock 0, etc.).
+    let mut config = GameboyConfigAbi {
+        bytes: [0; GAMEBOY_CONFIG_SIZE],
+    };
+
+    let controller = CONTROLLER_TYPE_GAMEBOY_CONTROLLER.to_le_bytes();
+    config.bytes[GAMEBOY_PORT1_TYPE_OFFSET..GAMEBOY_PORT1_TYPE_OFFSET + 4]
+        .copy_from_slice(&controller);
+    config.bytes[GAMEBOY_PORT2_TYPE_OFFSET..GAMEBOY_PORT2_TYPE_OFFSET + 4]
+        .copy_from_slice(&controller);
+
+    config.bytes[GAMEBOY_MODEL_OFFSET..GAMEBOY_MODEL_OFFSET + 4]
+        .copy_from_slice(&GAMEBOY_MODEL_AUTO_FAVOR_GBC.to_le_bytes());
+    config.bytes[GAMEBOY_USE_SGB2_OFFSET] = 1;
+    config.bytes[GAMEBOY_BLEND_FRAMES_OFFSET] = 1;
+    config.bytes[GAMEBOY_ADJUST_COLORS_OFFSET] = 1;
+    // RamState::Random = 0 (mantido em zero).
+
+    // Paletas monocromáticas padrão da UI do Mesen.
+    let colors = [0xFFFFFFu32, 0xB0B0B0, 0x686868, 0x000000];
+    for (offset, palette) in [
+        (GAMEBOY_BG_COLORS_OFFSET, colors),
+        (GAMEBOY_OBJ0_COLORS_OFFSET, colors),
+        (GAMEBOY_OBJ1_COLORS_OFFSET, colors),
+    ] {
+        for (index, color) in palette.iter().enumerate() {
+            let at = offset + index * 4;
+            config.bytes[at..at + 4].copy_from_slice(&color.to_le_bytes());
+        }
+    }
+
+    let volume = 100u32.to_le_bytes();
+    for index in 0..GAMEBOY_CHANNEL_COUNT {
+        let offset = GAMEBOY_CHANNEL_VOLUMES_OFFSET + index * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&volume);
+    }
+
+    unsafe { SetGameboyConfig(config) };
 }
 
 /// Reinicia o jogo atual pelo atalho interno do Mesen (equivalente ao reset).
