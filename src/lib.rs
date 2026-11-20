@@ -21,13 +21,6 @@ pub fn is_shutting_down() -> bool {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameInfo {
-    pub width: u32,
-    pub height: u32,
-}
-
-#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DebugControllerState {
     pub a: bool,
@@ -156,7 +149,6 @@ extern "C" {
     pub fn LoadRom(filename: *mut c_char, patchFile: *mut c_char) -> bool;
     pub fn IsRunning() -> bool;
     pub fn Stop();
-    pub fn GetBaseScreenSize() -> FrameInfo;
     pub fn RegisterNotificationCallback(callback: NotificationListenerCallback) -> *mut c_void;
     pub fn UnregisterNotificationCallback(listener: *mut c_void);
     pub fn InitializeDebugger();
@@ -263,7 +255,6 @@ pub fn connect_nes_controllers() {
     config.bytes[NES_EPSM_VOLUME_OFFSET..NES_EPSM_VOLUME_OFFSET + 4].copy_from_slice(&volume);
 
     unsafe { SetNesConfig(config) };
-    eprintln!("[emmu-mesen-sys] Port1/Port2 = NesController; ChannelVolumes = 100");
 }
 
 /// Configura controles, volumes e overscan do SNES para uma instância headless.
@@ -306,9 +297,6 @@ pub fn connect_snes_controllers() {
         .copy_from_slice(&(-1i64).to_le_bytes());
 
     unsafe { SetSnesConfig(config) };
-    eprintln!(
-        "[emmu-mesen-sys] Port1/Port2 = SnesController; ChannelVolumes = 100; Overscan = 7/8"
-    );
 }
 
 /// Configura o áudio do Mesen para o dispositivo padrão do SDL.
@@ -319,7 +307,6 @@ pub fn connect_snes_controllers() {
 /// `strlen(nullptr)` (SIGSEGV) na thread de emulação.
 pub fn configure_audio() {
     set_audio_volume(100);
-    eprintln!("[emmu-mesen-sys] AudioConfig ajustado para dispositivo padrão");
 }
 
 fn audio_config(volume: u32) -> AudioConfigAbi {
@@ -370,7 +357,6 @@ pub fn set_input_overrides(index: u32, state: DebugControllerState) {
     if is_shutting_down() {
         return;
     }
-    eprintln!("[emmu-mesen-sys] SetInputOverrides index={index} state={state:?}");
     unsafe {
         SetInputOverrides(index, state);
     }
@@ -391,9 +377,8 @@ mod tests {
 
     #[test]
     fn test_mesen_ping_and_build_date() {
-        let (ok, ver) = ping();
+        let (ok, _ver) = ping();
         let date = build_date();
-        println!("TestDll={ok}, GetMesenVersion={ver}, GetMesenBuildDate={date:?}");
         assert!(ok);
         assert!(date.is_some());
     }
@@ -420,10 +405,7 @@ mod tests {
     fn test_mesen_load_rom() {
         let rom_path = match std::env::var("MESEN_TEST_ROM") {
             Ok(p) if !p.is_empty() => p,
-            _ => {
-                println!("Pulando test_mesen_load_rom: defina MESEN_TEST_ROM=/Users/lucas_carvalho/Documentos 2/emmu-nes-roms/roms/Adventure Island (USA).nes");
-                return;
-            }
+            _ => return,
         };
 
         let home = CString::new("/tmp/mesen_home").unwrap();
@@ -442,7 +424,6 @@ mod tests {
 
         let loaded = load_rom(&rom_path, None).expect("caminho com byte nulo");
         let running_after_load = is_running();
-        println!("ROM={rom_path}, loaded={loaded}, is_running={running_after_load}");
 
         if running_after_load {
             stop_emu();
