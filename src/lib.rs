@@ -1,6 +1,7 @@
 /** emmu/crates/emmu-mesen-sys/src/lib.rs */
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NOTIFICATION_PPU_FRAME_DONE: c_int = 7;
@@ -91,6 +92,41 @@ pub const SNES_OVERSCAN_OFFSET: usize = 9948;
 pub const SNES_GSU_CLOCK_SPEED_OFFSET: usize = 10020;
 pub const SNES_BSX_CUSTOM_DATE_OFFSET: usize = 10024;
 
+/// Tamanho de `GbaConfig` na ABI do MesenCE (confirmado com `offsetof`).
+pub const GBA_CONFIG_SIZE: usize = 1048;
+
+/// Cópia opaca de `GbaConfig`. Alinhamento 4, igual ao da estrutura C++.
+#[repr(C, align(4))]
+pub struct GbaConfigAbi {
+    pub bytes: [u8; GBA_CONFIG_SIZE],
+}
+
+/// `offsetof(GbaConfig, Controller.Type)` e
+/// `ControllerType::GbaController` na enum do MesenCE.
+pub const GBA_CONTROLLER_TYPE_OFFSET: usize = 988;
+pub const CONTROLLER_TYPE_GBA_CONTROLLER: u32 = 50;
+
+/// `GbaConfig::SkipBootScreen`. Mantemos `false`: o Mesen não tem HLE de SWI
+/// e os jogos dependem das rotinas do BIOS; pular o boot trava a CPU em
+/// `DISPCNT=0x80` (tela branca) mesmo com a ROM carregada.
+pub const GBA_SKIP_BOOT_SCREEN_OFFSET: usize = 992;
+/// Defaults C++ de `GbaConfig` que precisam ser reaplicados porque montamos a
+/// estrutura zerada (`SnesConfig` já faz o mesmo para overscan).
+pub const GBA_BLEND_FRAMES_OFFSET: usize = 994;
+pub const GBA_ADJUST_COLORS_OFFSET: usize = 995;
+/// `GbaConfig::ChannelAVol` (6 volumes u32 em sequência).
+pub const GBA_CHANNEL_VOLUMES_OFFSET: usize = 1024;
+pub const GBA_CHANNEL_COUNT: usize = 6;
+
+/// Parâmetro de `ExecuteShortcut` — `EmulatorShortcut::Reset` na ABI do MesenCE.
+#[repr(C)]
+pub struct ExecuteShortcutParams {
+    pub shortcut: u32,
+    pub param: u32,
+    pub param_ptr: *mut c_void,
+}
+pub const SHORTCUT_RESET: u32 = 30;
+
 /// Structs enviadas por `RefreshSoftwareRenderer` (SoftwareRenderer.cpp).
 #[repr(C)]
 pub struct SoftwareRendererSurfaceAbi {
@@ -132,6 +168,8 @@ extern "C" {
     pub fn GetNesConfig() -> NesConfigAbi;
     pub fn SetNesConfig(config: NesConfigAbi);
     pub fn SetSnesConfig(config: SnesConfigAbi);
+    pub fn SetGbaConfig(config: GbaConfigAbi);
+    pub fn ExecuteShortcut(params: ExecuteShortcutParams);
     pub fn SetAudioConfig(config: AudioConfigAbi);
     pub fn SaveStateFile(filepath: *mut c_char);
     pub fn LoadStateFile(filepath: *mut c_char);
@@ -168,6 +206,30 @@ pub fn build_date() -> Option<String> {
         }
         Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
     }
+}
+
+/// BIOS GBA open-source (MIT) usada quando o usuário não forneceu uma.
+///
+/// O Mesen não emula as chamadas SWI em alto nível: sem `gba_bios.bin` os
+/// jogos executam zeros no vetor de software interrupt e nunca limpam
+/// `DISPCNT.ForcedBlank`, ficando com a tela branca.
+const GBA_BIOS: &[u8] = include_bytes!("../resources/gba_bios.bin");
+
+/// Instala a BIOS em `<home>/Firmware/gba_bios.bin` antes de `LoadRom`.
+///
+/// Um arquivo existente com o tamanho correto é preservado, para não
+/// sobrescrever uma BIOS oficial fornecida pelo usuário.
+pub fn install_gba_bios(home_folder: &str) -> Result<(), std::io::Error> {
+    let path = Path::new(home_folder).join("Firmware").join("gba_bios.bin");
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        if metadata.len() == GBA_BIOS.len() as u64 {
+            return Ok(());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, GBA_BIOS)
 }
 
 pub fn load_rom(rom_path: &str, patch_path: Option<&str>) -> Result<bool, std::ffi::NulError> {
@@ -297,6 +359,52 @@ pub fn connect_snes_controllers() {
         .copy_from_slice(&(-1i64).to_le_bytes());
 
     unsafe { SetSnesConfig(config) };
+}
+
+/// Configura controle, boot com BIOS e volumes do GBA para uma instância headless.
+///
+/// Chamado antes de `LoadRom`, porque o MesenCE cria os control devices apenas
+/// uma vez durante o carregamento da ROM.
+pub fn connect_gba_controllers() {
+    if is_shutting_down() {
+        return;
+    }
+    let mut config = GbaConfigAbi {
+        bytes: [0; GBA_CONFIG_SIZE],
+    };
+
+    let controller = CONTROLLER_TYPE_GBA_CONTROLLER.to_le_bytes();
+    config.bytes[GBA_CONTROLLER_TYPE_OFFSET..GBA_CONTROLLER_TYPE_OFFSET + 4]
+        .copy_from_slice(&controller);
+
+    // Não pular o boot: o Mesen não tem HLE de SWI e o boot ROM real (instalado
+    // por `install_gba_bios`) é necessário para as rotinas do BIOS usadas pelos
+    // jogos. Com `SkipBootScreen=true` a tela fica branca (DISPCNT=0x80).
+    config.bytes[GBA_SKIP_BOOT_SCREEN_OFFSET] = 0;
+    config.bytes[GBA_BLEND_FRAMES_OFFSET] = 1;
+    config.bytes[GBA_ADJUST_COLORS_OFFSET] = 1;
+
+    let volume = 100u32.to_le_bytes();
+    for i in 0..GBA_CHANNEL_COUNT {
+        let offset = GBA_CHANNEL_VOLUMES_OFFSET + i * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&volume);
+    }
+
+    unsafe { SetGbaConfig(config) };
+}
+
+/// Reinicia o jogo atual pelo atalho interno do Mesen (equivalente ao reset).
+pub fn reset() {
+    if is_shutting_down() {
+        return;
+    }
+    unsafe {
+        ExecuteShortcut(ExecuteShortcutParams {
+            shortcut: SHORTCUT_RESET,
+            param: 0,
+            param_ptr: std::ptr::null_mut(),
+        });
+    }
 }
 
 /// Configura o áudio do Mesen para o dispositivo padrão do SDL.
