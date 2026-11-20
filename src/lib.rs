@@ -4,6 +4,9 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NOTIFICATION_PPU_FRAME_DONE: c_int = 7;
+/// `SoftwareRenderer::Render()` envia um `SoftwareRendererFrame` com buffer
+/// ARGB pronto (o `PpuFrameDone` do SNES não passa o buffer como parâmetro).
+pub const NOTIFICATION_REFRESH_SOFTWARE_RENDERER: c_int = 22;
 
 pub type NotificationListenerCallback = Option<extern "C" fn(c_int, *mut c_void)>;
 
@@ -66,6 +69,51 @@ pub const NES_CHANNEL_VOLUMES_OFFSET: usize = 14072;
 pub const NES_CHANNEL_COUNT: usize = 11;
 pub const NES_EPSM_VOLUME_OFFSET: usize = 14116;
 
+/// Tamanho de `SnesConfig` na ABI do MesenCE (ver Core/Shared/SettingTypes.h).
+pub const SNES_CONFIG_SIZE: usize = 10032;
+
+/// Cópia opaca de `SnesConfig`. O alinhamento de 8 casa com o `int64_t`
+/// `BsxCustomDate` no fim da estrutura C++.
+#[repr(C, align(8))]
+pub struct SnesConfigAbi {
+    pub bytes: [u8; SNES_CONFIG_SIZE],
+}
+
+/// `offsetof(SnesConfig, Port1.Type)` / `Port2.Type` — as mesmas de NES,
+/// porque `ControllerConfig` tem o mesmo layout.
+pub const SNES_PORT1_TYPE_OFFSET: usize = 988;
+pub const SNES_PORT2_TYPE_OFFSET: usize = 1980;
+/// `ControllerType::SnesController` na enum do MesenCE.
+pub const CONTROLLER_TYPE_SNES_CONTROLLER: u32 = 1;
+
+/// `SnesConfig::ChannelVolumes[8]` — diferente do NES, o default é 100, mas
+/// como reconstruímos a estrutura zerada precisamos escrever 100 em cada um.
+pub const SNES_CHANNEL_VOLUMES_OFFSET: usize = 9968;
+pub const SNES_CHANNEL_COUNT: usize = 8;
+/// `SnesConfig::Overscan` (Left, Right, Top, Bottom) — aplica o mesmo crop
+/// que a UI do Mesen usa, deixando o frame 256x224 igual ao core WASM web.
+pub const SNES_OVERSCAN_OFFSET: usize = 9948;
+/// `SnesConfig::GsuClockSpeed` e `BsxCustomDate` — os únicos campos cujo
+/// valor padrão C++ não é zero (todos os enums começam em 0 = Auto/None/Weave).
+pub const SNES_GSU_CLOCK_SPEED_OFFSET: usize = 10020;
+pub const SNES_BSX_CUSTOM_DATE_OFFSET: usize = 10024;
+
+/// Structs enviadas por `RefreshSoftwareRenderer` (SoftwareRenderer.cpp).
+#[repr(C)]
+pub struct SoftwareRendererSurfaceAbi {
+    pub buffer: *const u32,
+    pub width: u32,
+    pub height: u32,
+    pub is_dirty: bool,
+}
+
+#[repr(C)]
+pub struct SoftwareRendererFrameAbi {
+    pub frame: SoftwareRendererSurfaceAbi,
+    pub emu_hud: SoftwareRendererSurfaceAbi,
+    pub script_hud: SoftwareRendererSurfaceAbi,
+}
+
 /// Tamanho/alinhamento de `AudioConfig` na ABI do MesenCE.
 pub const AUDIO_CONFIG_SIZE: usize = 240;
 const AUDIO_DEVICE_OFFSET: usize = 8;
@@ -90,6 +138,7 @@ extern "C" {
     pub fn GetMesenBuildDate() -> *const c_char;
     pub fn GetNesConfig() -> NesConfigAbi;
     pub fn SetNesConfig(config: NesConfigAbi);
+    pub fn SetSnesConfig(config: SnesConfigAbi);
     pub fn SetAudioConfig(config: AudioConfigAbi);
     pub fn SaveStateFile(filepath: *mut c_char);
     pub fn LoadStateFile(filepath: *mut c_char);
@@ -198,6 +247,10 @@ pub fn connect_nes_controllers() {
     }
     let mut config = unsafe { GetNesConfig() };
 
+    // Sempre conecta as duas portas. O "desconectar" do P2 é feito no Player
+    // (teclas P2 ignoradas + soltar overrides), porque o MesenCE não reconstrói
+    // os devices de controle em runtime quando NesConfig muda (o noisy
+    // `RequestConfigChange` só é tratado pela UI C# que não existe aqui).
     let controller = CONTROLLER_TYPE_NES_CONTROLLER.to_le_bytes();
     config.bytes[NES_PORT1_TYPE_OFFSET..NES_PORT1_TYPE_OFFSET + 4].copy_from_slice(&controller);
     config.bytes[NES_PORT2_TYPE_OFFSET..NES_PORT2_TYPE_OFFSET + 4].copy_from_slice(&controller);
@@ -211,6 +264,51 @@ pub fn connect_nes_controllers() {
 
     unsafe { SetNesConfig(config) };
     eprintln!("[emmu-mesen-sys] Port1/Port2 = NesController; ChannelVolumes = 100");
+}
+
+/// Configura controles, volumes e overscan do SNES para uma instância headless.
+///
+/// Chamado antes de `LoadRom`, porque o MesenCE cria os control devices uma
+/// única vez durante o carregamento e não os reconstrói quando a config muda
+/// em runtime (o `RequestConfigChange` só é tratado pela UI C#).
+pub fn connect_snes_controllers() {
+    if is_shutting_down() {
+        return;
+    }
+    // A ABI do MesenCE não exporta GetSnesConfig, então montamos a estrutura
+    // do zero. Todos os enums de SnesConfig têm valor 0 = padrão do C++
+    // (ConsoleRegion::Auto, RamState::Random, DspInterpolationType::Gauss,
+    // SnesColorCorrectionMode::None, SnesDeinterlaceMode::Weave, ...).
+    let mut config = SnesConfigAbi {
+        bytes: [0; SNES_CONFIG_SIZE],
+    };
+
+    let controller = CONTROLLER_TYPE_SNES_CONTROLLER.to_le_bytes();
+    config.bytes[SNES_PORT1_TYPE_OFFSET..SNES_PORT1_TYPE_OFFSET + 4].copy_from_slice(&controller);
+    config.bytes[SNES_PORT2_TYPE_OFFSET..SNES_PORT2_TYPE_OFFSET + 4].copy_from_slice(&controller);
+
+    let volume = 100u32.to_le_bytes();
+    for i in 0..SNES_CHANNEL_COUNT {
+        let offset = SNES_CHANNEL_VOLUMES_OFFSET + i * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&volume);
+    }
+
+    // Left / Right / Top / Bottom = 0 / 0 / 7 / 8 (padrão da UI do Mesen),
+    // deixando o frame 256x224 igual ao core WASM usado na web.
+    for (i, value) in [0u32, 0, 7, 8].iter().enumerate() {
+        let offset = SNES_OVERSCAN_OFFSET + i * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    config.bytes[SNES_GSU_CLOCK_SPEED_OFFSET..SNES_GSU_CLOCK_SPEED_OFFSET + 4]
+        .copy_from_slice(&100u32.to_le_bytes());
+    config.bytes[SNES_BSX_CUSTOM_DATE_OFFSET..SNES_BSX_CUSTOM_DATE_OFFSET + 8]
+        .copy_from_slice(&(-1i64).to_le_bytes());
+
+    unsafe { SetSnesConfig(config) };
+    eprintln!(
+        "[emmu-mesen-sys] Port1/Port2 = SnesController; ChannelVolumes = 100; Overscan = 7/8"
+    );
 }
 
 /// Configura o áudio do Mesen para o dispositivo padrão do SDL.
