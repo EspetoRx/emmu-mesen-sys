@@ -12,10 +12,11 @@ Ligação FFI entre o Emmu desktop e o núcleo nativo **MesenCE/Mesen 2**. Este 
   - `GbaConfigAbi` (1.048 bytes, align 4)
   - `GameboyConfigAbi` (2.084 bytes, align 4)
   - `PceConfigAbi` (8.084 bytes, align 4)
+  - `SmsConfigAbi` (2.080 bytes, align 4)
   - `AudioConfigAbi` (240 bytes, align 8)
   - `SoftwareRendererSurfaceAbi` / `SoftwareRendererFrameAbi`
 - Declara as funções `extern "C"` da DLL: `TestDll`, `GetMesenVersion`, `GetMesenBuildDate`, `InitDll`, `InitializeEmu`, `LoadRom`, `SaveStateFile`, `LoadStateFile`, `ExecuteShortcut`, `SetInputOverrides`, `RegisterNotificationCallback`, entre outras.
-- Expõe wrappers Rust: `ping`, `build_date`, `install_gba_bios`, `load_rom`, `is_running`, `stop_emu`, `initialize_debugger`, `connect_nes_controllers`, `connect_snes_controllers`, `connect_gba_controllers`, `connect_gameboy_controllers`, `connect_gameboy_dmg_controllers`, `connect_pce_controllers`, `reset`, `configure_audio`, `set_audio_volume`, `save_state_to_file`, `load_state_from_file`, `set_input_overrides`, `release`, `mark_shutting_down` e `is_shutting_down`.
+- Expõe wrappers Rust: `ping`, `build_date`, `install_gba_bios`, `load_rom`, `is_running`, `stop_emu`, `initialize_debugger`, `connect_nes_controllers`, `connect_snes_controllers`, `connect_gba_controllers`, `connect_gameboy_controllers`, `connect_gameboy_dmg_controllers`, `connect_sms_controllers`, `connect_pce_controllers`, `reset`, `configure_audio`, `set_audio_volume`, `save_state_to_file`, `load_state_from_file`, `set_input_overrides`, `release`, `mark_shutting_down` e `is_shutting_down`.
 - Registra notificações `NOTIFICATION_PPU_FRAME_DONE = 7` e `NOTIFICATION_REFRESH_SOFTWARE_RENDERER = 22`.
 - Possui um guard atômico de shutdown para impedir chamadas FFI depois de `Release()`; `release()` é idempotente.
 
@@ -28,6 +29,7 @@ Ligação FFI entre o Emmu desktop e o núcleo nativo **MesenCE/Mesen 2**. Este 
 | GBA | `connect_gba_controllers` | `ControllerType = 50`, `SkipBootScreen = 0` porque não há SWI HLE |
 | GB/GBC | `connect_gameboy_controllers` / `connect_gameboy_dmg_controllers` | `ControllerType = 42`, `AutoFavorGbc = 1`, `Gameboy = 4` |
 | PCE | `connect_pce_controllers` | `ControllerType = 44`, `PceConsoleType::TurboGrafx = 3`, paleta padrão em `PCE_PALETTE_OFFSET = 6036` |
+| SMS/GG | `connect_sms_controllers` | `ControllerType = 47`, `GameGearOverscan = 48` nos 4 lados (frame 160x144), volumes e LCD/blend reaplicados |
 
 `src/pce_palette.rs` contém `PCE_DEFAULT_PALETTE: [u32; 512]`, copiada de `MesenCE/UI/Config/PcEngineConfig.cs`. Sem ela, o filtro de vídeo PCE do Mesen renderiza tudo preto.
 
@@ -105,6 +107,7 @@ cargo test -p emmu-mesen-sys
 
 MESEN_TEST_ROM="/caminho/jogo.nes" cargo test -p emmu-mesen-sys test_mesen_load_rom -- --nocapture
 MESEN_PCE_TEST_ROM="/caminho/jogo.pce" cargo test -p emmu-mesen-sys test_mesen_load_pce_rom -- --nocapture
+MESEN_GG_TEST_ROM="/caminho/jogo.gg" cargo test -p emmu-mesen-sys test_mesen_load_gg_rom -- --nocapture
 ```
 
 Os testes exigem um `MesenCore` linkável.

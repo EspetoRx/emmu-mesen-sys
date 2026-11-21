@@ -153,6 +153,35 @@ pub const GAMEBOY_MODEL_AUTO_FAVOR_GBC: u32 = 1;
 /// `GameboyModel::Gameboy`: força o DMG clássico (sem colorização CGB).
 pub const GAMEBOY_MODEL_GAMEBOY: u32 = 4;
 
+/// Tamanho de `SmsConfig` na ABI do MesenCE (confirmado com `offsetof`).
+pub const SMS_CONFIG_SIZE: usize = 2080;
+
+/// Cópia opaca de `SmsConfig`. Alinhamento 4, igual ao da estrutura C++.
+#[repr(C, align(4))]
+pub struct SmsConfigAbi {
+    pub bytes: [u8; SMS_CONFIG_SIZE],
+}
+
+/// `offsetof(SmsConfig, Port1.Type)` / `Port2.Type`.
+pub const SMS_PORT1_TYPE_OFFSET: usize = 988;
+pub const SMS_PORT2_TYPE_OFFSET: usize = 1980;
+/// `ControllerType::SmsController` na enum do MesenCE.
+pub const CONTROLLER_TYPE_SMS_CONTROLLER: u32 = 47;
+
+/// Defaults C++ de `SmsConfig` que precisam ser reaplicados porque montamos a
+/// estrutura zerada: sem isto o Mesen usa volumes zerados e o filtro LCD não
+/// recebe o crop padrão do Game Gear.
+pub const SMS_USE_SG_PALETTE_OFFSET: usize = 2001;
+pub const SMS_GG_BLEND_FRAMES_OFFSET: usize = 2002;
+pub const SMS_CHANNEL_VOLUMES_OFFSET: usize = 2008;
+pub const SMS_CHANNEL_COUNT: usize = 4;
+pub const SMS_FM_AUDIO_VOLUME_OFFSET: usize = 2024;
+pub const SMS_ENABLE_FM_AUDIO_OFFSET: usize = 2028;
+/// `SmsConfig::GameGearOverscan` (Left, Right, Top, Bottom). O valor 48 em
+/// cada lado produz os 160x144 da tela LCD, iguais ao core WASM e ao GB/GBC.
+pub const SMS_GAME_GEAR_OVERSCAN_OFFSET: usize = 2064;
+pub const SMS_GAME_GEAR_OVERSCAN: u32 = 48;
+
 /// Tamanho de `PcEngineConfig` na ABI do MesenCE (confirmado com `offsetof`).
 pub const PCE_CONFIG_SIZE: usize = 8084;
 
@@ -234,6 +263,7 @@ extern "C" {
     pub fn SetSnesConfig(config: SnesConfigAbi);
     pub fn SetGbaConfig(config: GbaConfigAbi);
     pub fn SetGameboyConfig(config: GameboyConfigAbi);
+    pub fn SetSmsConfig(config: SmsConfigAbi);
     pub fn SetPcEngineConfig(config: PceConfigAbi);
     pub fn ExecuteShortcut(params: ExecuteShortcutParams);
     pub fn SetAudioConfig(config: AudioConfigAbi);
@@ -518,6 +548,46 @@ pub fn connect_gameboy_dmg_controllers() {
     connect_gameboy_controllers_with_model(GAMEBOY_MODEL_GAMEBOY);
 }
 
+/// Configura controle, vídeo e volumes de SMS/Game Gear para uma instância
+/// headless. Chamado antes de `LoadRom`, porque o MesenCE cria os control
+/// devices e escolhe o filtro de vídeo apenas uma vez durante o carregamento.
+pub fn connect_sms_controllers() {
+    if is_shutting_down() {
+        return;
+    }
+    // A ABI não exporta GetSmsConfig, então reconstruímos a estrutura. Campos
+    // deixados em zero já têm o valor padrão do C++ (Region/GameGearRegion
+    // Auto, RamState::Random, SmsRevision::Compatibility, sem FM/sprite limits).
+    let mut config = SmsConfigAbi {
+        bytes: [0; SMS_CONFIG_SIZE],
+    };
+
+    let controller = CONTROLLER_TYPE_SMS_CONTROLLER.to_le_bytes();
+    config.bytes[SMS_PORT1_TYPE_OFFSET..SMS_PORT1_TYPE_OFFSET + 4].copy_from_slice(&controller);
+    config.bytes[SMS_PORT2_TYPE_OFFSET..SMS_PORT2_TYPE_OFFSET + 4].copy_from_slice(&controller);
+
+    config.bytes[SMS_USE_SG_PALETTE_OFFSET] = 1;
+    config.bytes[SMS_GG_BLEND_FRAMES_OFFSET] = 1;
+
+    let volume = 100u32.to_le_bytes();
+    for index in 0..SMS_CHANNEL_COUNT {
+        let offset = SMS_CHANNEL_VOLUMES_OFFSET + index * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&volume);
+    }
+    config.bytes[SMS_FM_AUDIO_VOLUME_OFFSET..SMS_FM_AUDIO_VOLUME_OFFSET + 4]
+        .copy_from_slice(&volume);
+    config.bytes[SMS_ENABLE_FM_AUDIO_OFFSET] = 1;
+
+    // Sem este crop o Mesen publica o frame bruto 256x240 com bordas, enquanto
+    // o core web e o Game Boy usam a área útil 160x144 do LCD do Game Gear.
+    for index in 0..4 {
+        let offset = SMS_GAME_GEAR_OVERSCAN_OFFSET + index * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&SMS_GAME_GEAR_OVERSCAN.to_le_bytes());
+    }
+
+    unsafe { SetSmsConfig(config) };
+}
+
 /// Configura controle, console e volumes de PC Engine para uma instância
 /// headless. Chamado antes de `LoadRom`, porque o MesenCE cria os control
 /// devices apenas uma vez durante o carregamento da ROM.
@@ -753,5 +823,46 @@ mod tests {
 
         assert!(loaded, "LoadRom retornou false para {rom_path}");
         assert!(running_after_load, "PCE não iniciou após LoadRom");
+    }
+
+    #[test]
+    fn test_mesen_load_gg_rom() {
+        let rom_path = match std::env::var("MESEN_GG_TEST_ROM") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return,
+        };
+        assert!(
+            rom_path.to_ascii_lowercase().ends_with(".gg"),
+            "MESEN_GG_TEST_ROM deve apontar para um arquivo .gg"
+        );
+
+        let home = CString::new("/tmp/mesen_home").unwrap();
+        unsafe {
+            InitializeEmu(
+                home.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                false,
+                true,
+                true,
+                true,
+            );
+            InitDll();
+        }
+
+        connect_sms_controllers();
+        let loaded = load_rom(&rom_path, None).expect("caminho com byte nulo");
+        let running_after_load = is_running();
+
+        if running_after_load {
+            stop_emu();
+        }
+
+        unsafe {
+            Release();
+        }
+
+        assert!(loaded, "LoadRom retornou false para {rom_path}");
+        assert!(running_after_load, "Game Gear não iniciou após LoadRom");
     }
 }
