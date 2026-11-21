@@ -1,0 +1,3 @@
+# Gerado por scripts/build-sdl2.sh — binários de terceiros não entram no git.
+runtime/
+runtime-link/
