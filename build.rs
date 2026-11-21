@@ -38,5 +38,8 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", link_dir.display());
     println!("cargo:rustc-link-lib=dylib=MesenCore");
     println!("cargo:rerun-if-env-changed=MESEN_LIB_DIR");
-    println!("cargo:rerun-if-changed={}", link_dir.join(core_name).display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        link_dir.join(core_name).display()
+    );
 }

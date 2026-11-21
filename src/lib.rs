@@ -151,6 +151,32 @@ pub const GAMEBOY_MODEL_AUTO_FAVOR_GBC: u32 = 1;
 /// `GameboyModel::Gameboy`: força o DMG clássico (sem colorização CGB).
 pub const GAMEBOY_MODEL_GAMEBOY: u32 = 4;
 
+/// Tamanho de `PcEngineConfig` na ABI do MesenCE (confirmado com `offsetof`).
+pub const PCE_CONFIG_SIZE: usize = 8084;
+
+/// Cópia opaca de `PcEngineConfig`. Alinhamento 4, igual ao da estrutura C++.
+#[repr(C, align(4))]
+pub struct PceConfigAbi {
+    pub bytes: [u8; PCE_CONFIG_SIZE],
+}
+
+/// `offsetof(PcEngineConfig, Port1.Type)`.
+pub const PCE_PORT1_TYPE_OFFSET: usize = 988;
+/// `ControllerType::PceController` na enum do MesenCE.
+pub const CONTROLLER_TYPE_PCE_CONTROLLER: u32 = 44;
+/// `PceConsoleType::TurboGrafx` (evita o travamento de region locking de jogos
+/// norte-americanos quando `Auto` é usado, ver `PceMemoryManager.cpp`).
+pub const PCE_CONSOLE_TYPE_TURBOGRAFX: u32 = 3;
+/// Defaults C++ de `PcEngineConfig` que precisam ser reaplicados porque a ABI
+/// não exporta `GetPcEngineConfig` e montamos a estrutura zerada.
+pub const PCE_CONSOLE_TYPE_OFFSET: usize = 5956;
+pub const PCE_ADPCM_CLOCK_SPEED_OFFSET: usize = 5976;
+pub const PCE_CHANNEL_VOLUMES_OFFSET: usize = 5980;
+pub const PCE_CHANNEL_COUNT: usize = 6;
+pub const PCE_CD_AUDIO_VOLUME_OFFSET: usize = 6004;
+pub const PCE_ADPCM_VOLUME_OFFSET: usize = 6008;
+pub const PCE_USE_HUC6280A_AUDIO_OFFSET: usize = 6012;
+
 /// Parâmetro de `ExecuteShortcut` — `EmulatorShortcut::Reset` na ABI do MesenCE.
 #[repr(C)]
 pub struct ExecuteShortcutParams {
@@ -203,6 +229,7 @@ extern "C" {
     pub fn SetSnesConfig(config: SnesConfigAbi);
     pub fn SetGbaConfig(config: GbaConfigAbi);
     pub fn SetGameboyConfig(config: GameboyConfigAbi);
+    pub fn SetPcEngineConfig(config: PceConfigAbi);
     pub fn ExecuteShortcut(params: ExecuteShortcutParams);
     pub fn SetAudioConfig(config: AudioConfigAbi);
     pub fn SaveStateFile(filepath: *mut c_char);
@@ -486,6 +513,43 @@ pub fn connect_gameboy_dmg_controllers() {
     connect_gameboy_controllers_with_model(GAMEBOY_MODEL_GAMEBOY);
 }
 
+/// Configura controle, console e volumes de PC Engine para uma instância
+/// headless. Chamado antes de `LoadRom`, porque o MesenCE cria os control
+/// devices apenas uma vez durante o carregamento da ROM.
+pub fn connect_pce_controllers() {
+    if is_shutting_down() {
+        return;
+    }
+    // A ABI não exporta GetPcEngineConfig, então reconstruímos a estrutura.
+    // Campos deixados em zero já têm o valor padrão do C++ (sem CD-ROM,
+    // RamState::Random, sem overlays, etc.).
+    let mut config = PceConfigAbi {
+        bytes: [0; PCE_CONFIG_SIZE],
+    };
+
+    let controller = CONTROLLER_TYPE_PCE_CONTROLLER.to_le_bytes();
+    config.bytes[PCE_PORT1_TYPE_OFFSET..PCE_PORT1_TYPE_OFFSET + 4].copy_from_slice(&controller);
+    config.bytes[PCE_ADPCM_CLOCK_SPEED_OFFSET..PCE_ADPCM_CLOCK_SPEED_OFFSET + 4]
+        .copy_from_slice(&32100u32.to_le_bytes());
+
+    // `PceConsoleType::TurboGrafx` força o bit de região norte-americana na
+    // MEM 0x1960; com `Auto` alguns jogos (ex.: Aero Blasters) travam.
+    config.bytes[PCE_CONSOLE_TYPE_OFFSET..PCE_CONSOLE_TYPE_OFFSET + 4]
+        .copy_from_slice(&PCE_CONSOLE_TYPE_TURBOGRAFX.to_le_bytes());
+
+    let volume = 100u32.to_le_bytes();
+    for index in 0..PCE_CHANNEL_COUNT {
+        let offset = PCE_CHANNEL_VOLUMES_OFFSET + index * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&volume);
+    }
+    for offset in [PCE_CD_AUDIO_VOLUME_OFFSET, PCE_ADPCM_VOLUME_OFFSET] {
+        config.bytes[offset..offset + 4].copy_from_slice(&volume);
+    }
+    config.bytes[PCE_USE_HUC6280A_AUDIO_OFFSET] = 1;
+
+    unsafe { SetPcEngineConfig(config) };
+}
+
 /// Reinicia o jogo atual pelo atalho interno do Mesen (equivalente ao reset).
 pub fn reset() {
     if is_shutting_down() {
@@ -635,5 +699,47 @@ mod tests {
         }
 
         assert!(loaded, "LoadRom retornou false para {rom_path}");
+    }
+
+    #[test]
+    fn test_mesen_load_pce_rom() {
+        let rom_path = match std::env::var("MESEN_PCE_TEST_ROM") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return,
+        };
+
+        let home = CString::new("/tmp/mesen_home").unwrap();
+        unsafe {
+            InitializeEmu(
+                home.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                false,
+                true,
+                true,
+                true,
+            );
+            InitDll();
+        }
+
+        connect_pce_controllers();
+        eprintln!("PCE FFI: chamando LoadRom...");
+        let loaded = load_rom(&rom_path, None).expect("caminho com byte nulo");
+        eprintln!("PCE FFI: LoadRom={loaded}");
+        let running_after_load = is_running();
+        eprintln!("PCE FFI: IsRunning={running_after_load}");
+
+        if running_after_load {
+            stop_emu();
+            eprintln!("PCE FFI: Stop concluído");
+        }
+
+        unsafe {
+            Release();
+        }
+        eprintln!("PCE FFI: Release concluído");
+
+        assert!(loaded, "LoadRom retornou false para {rom_path}");
+        assert!(running_after_load, "PCE não iniciou após LoadRom");
     }
 }
