@@ -148,6 +148,8 @@ pub const GAMEBOY_CHANNEL_COUNT: usize = 4;
 /// `GameboyModel::AutoFavorGbc`: executa carts CGB como CGB e carts DMG no
 /// modo de compatibilidade colorido pelo boot ROM do CGB.
 pub const GAMEBOY_MODEL_AUTO_FAVOR_GBC: u32 = 1;
+/// `GameboyModel::Gameboy`: força o DMG clássico (sem colorização CGB).
+pub const GAMEBOY_MODEL_GAMEBOY: u32 = 4;
 
 /// Parâmetro de `ExecuteShortcut` — `EmulatorShortcut::Reset` na ABI do MesenCE.
 #[repr(C)]
@@ -425,10 +427,10 @@ pub fn connect_gba_controllers() {
     unsafe { SetGbaConfig(config) };
 }
 
-/// Configura controle, modelo e volumes de Game Boy / Game Boy Color para uma
-/// instância headless. Chamado antes de `LoadRom`, porque o MesenCE cria os
-/// control devices apenas uma vez durante o carregamento da ROM.
-pub fn connect_gameboy_controllers() {
+/// Configura controle, modelo e volumes de Game Boy para uma instância headless.
+/// Chamado antes de `LoadRom`, porque o MesenCE cria os control devices apenas
+/// uma vez durante o carregamento da ROM.
+pub fn connect_gameboy_controllers_with_model(model: u32) {
     if is_shutting_down() {
         return;
     }
@@ -446,7 +448,7 @@ pub fn connect_gameboy_controllers() {
         .copy_from_slice(&controller);
 
     config.bytes[GAMEBOY_MODEL_OFFSET..GAMEBOY_MODEL_OFFSET + 4]
-        .copy_from_slice(&GAMEBOY_MODEL_AUTO_FAVOR_GBC.to_le_bytes());
+        .copy_from_slice(&model.to_le_bytes());
     config.bytes[GAMEBOY_USE_SGB2_OFFSET] = 1;
     config.bytes[GAMEBOY_BLEND_FRAMES_OFFSET] = 1;
     config.bytes[GAMEBOY_ADJUST_COLORS_OFFSET] = 1;
@@ -472,6 +474,16 @@ pub fn connect_gameboy_controllers() {
     }
 
     unsafe { SetGameboyConfig(config) };
+}
+
+/// Game Boy Color: carts CGB em modo CGB e carts DMG coloridos pelo boot ROM.
+pub fn connect_gameboy_controllers() {
+    connect_gameboy_controllers_with_model(GAMEBOY_MODEL_AUTO_FAVOR_GBC);
+}
+
+/// Game Boy clássico (DMG): força o modo monocromático antes de `LoadRom`.
+pub fn connect_gameboy_dmg_controllers() {
+    connect_gameboy_controllers_with_model(GAMEBOY_MODEL_GAMEBOY);
 }
 
 /// Reinicia o jogo atual pelo atalho interno do Mesen (equivalente ao reset).
