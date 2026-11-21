@@ -211,6 +211,37 @@ pub const PCE_USE_HUC6280A_AUDIO_OFFSET: usize = 6012;
 /// estrutura (6036 + 2048 = 8084).
 pub const PCE_PALETTE_OFFSET: usize = 6036;
 
+/// Tamanho de `WsConfig` na ABI do MesenCE (confirmado com `offsetof`).
+pub const WS_CONFIG_SIZE: usize = 3008;
+
+/// Cópia opaca de `WsConfig`. Alinhamento 4, igual ao da estrutura C++.
+#[repr(C, align(4))]
+pub struct WsConfigAbi {
+    pub bytes: [u8; WS_CONFIG_SIZE],
+}
+
+/// Offsets de `WsConfig` medidos contra os headers do MesenCE.
+pub const WS_CONTROLLER_HORIZONTAL_OFFSET: usize = 0;
+pub const WS_CONTROLLER_VERTICAL_OFFSET: usize = 992;
+pub const WS_CONTROLLER_PCV2_OFFSET: usize = 1984;
+pub const WS_MODEL_OFFSET: usize = 2976;
+pub const WS_USE_BOOT_ROM_OFFSET: usize = 2977;
+pub const WS_AUTO_ROTATE_OFFSET: usize = 2978;
+pub const WS_BLEND_FRAMES_OFFSET: usize = 2979;
+pub const WS_LCD_ADJUST_COLORS_OFFSET: usize = 2980;
+pub const WS_LCD_SHOW_ICONS_OFFSET: usize = 2981;
+pub const WS_HIDE_BG_LAYERS_OFFSET: usize = 2982;
+pub const WS_DISABLE_SPRITES_OFFSET: usize = 2984;
+pub const WS_AUDIO_MODE_OFFSET: usize = 2985;
+pub const WS_CHANNEL_1_VOLUME_OFFSET: usize = 2988;
+pub const WS_CHANNEL_COUNT: usize = 5;
+/// `ControllerType::WsController` na enum do MesenCE.
+pub const CONTROLLER_TYPE_WS_CONTROLLER: u32 = 51;
+/// `WsModel::Auto`: escolhe Mono/Color pelo footer da ROM (ou `.pc2`).
+pub const WS_MODEL_AUTO: u8 = 0;
+/// `WsAudioMode::Headphones` (valor padrão do C++).
+pub const WS_AUDIO_MODE_HEADPHONES: u8 = 0;
+
 /// Parâmetro de `ExecuteShortcut` — `EmulatorShortcut::Reset` na ABI do MesenCE.
 #[repr(C)]
 pub struct ExecuteShortcutParams {
@@ -265,6 +296,7 @@ extern "C" {
     pub fn SetGameboyConfig(config: GameboyConfigAbi);
     pub fn SetSmsConfig(config: SmsConfigAbi);
     pub fn SetPcEngineConfig(config: PceConfigAbi);
+    pub fn SetWsConfig(config: WsConfigAbi);
     pub fn ExecuteShortcut(params: ExecuteShortcutParams);
     pub fn SetAudioConfig(config: AudioConfigAbi);
     pub fn SaveStateFile(filepath: *mut c_char);
@@ -632,6 +664,51 @@ pub fn connect_pce_controllers() {
     unsafe { SetPcEngineConfig(config) };
 }
 
+/// Configura controle, vídeo e volumes de WonderSwan para uma instância
+/// headless. Chamado antes de `LoadRom`, porque o MesenCE cria os control
+/// devices e escolhe o filtro de vídeo apenas uma vez durante o carregamento.
+pub fn connect_ws_controllers() {
+    if is_shutting_down() {
+        return;
+    }
+    // A ABI não exporta GetWsConfig, então reconstruímos a estrutura. O que
+    // fica zerado já é o default do C++ (Model::Auto, sem boot ROM, sem
+    // rotação, sem blend/LCD icons, Headphones).
+    let mut config = WsConfigAbi {
+        bytes: [0; WS_CONFIG_SIZE],
+    };
+
+    let controller = CONTROLLER_TYPE_WS_CONTROLLER.to_le_bytes();
+    for offset in [
+        WS_CONTROLLER_HORIZONTAL_OFFSET,
+        WS_CONTROLLER_VERTICAL_OFFSET,
+    ] {
+        config.bytes[offset..offset + 4].copy_from_slice(&controller);
+    }
+
+    config.bytes[WS_MODEL_OFFSET] = WS_MODEL_AUTO;
+    config.bytes[WS_USE_BOOT_ROM_OFFSET] = 0;
+    // Manter `AutoRotate` desligado preserva o frame nativo 224x144.
+    config.bytes[WS_AUTO_ROTATE_OFFSET] = 0;
+    config.bytes[WS_BLEND_FRAMES_OFFSET] = 0;
+    config.bytes[WS_LCD_ADJUST_COLORS_OFFSET] = 0;
+    // Com ícones ligados o Mesen publica 224x157; queremos só a área do jogo.
+    config.bytes[WS_LCD_SHOW_ICONS_OFFSET] = 0;
+    for offset in [WS_HIDE_BG_LAYERS_OFFSET, WS_HIDE_BG_LAYERS_OFFSET + 1] {
+        config.bytes[offset] = 0;
+    }
+    config.bytes[WS_DISABLE_SPRITES_OFFSET] = 0;
+    config.bytes[WS_AUDIO_MODE_OFFSET] = WS_AUDIO_MODE_HEADPHONES;
+
+    let volume = 100u32.to_le_bytes();
+    for index in 0..WS_CHANNEL_COUNT {
+        let offset = WS_CHANNEL_1_VOLUME_OFFSET + index * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&volume);
+    }
+
+    unsafe { SetWsConfig(config) };
+}
+
 /// Reinicia o jogo atual pelo atalho interno do Mesen (equivalente ao reset).
 pub fn reset() {
     if is_shutting_down() {
@@ -728,6 +805,12 @@ mod tests {
         let date = build_date();
         assert!(ok);
         assert!(date.is_some());
+    }
+
+    #[test]
+    fn ws_config_abi_matches_mesen() {
+        assert_eq!(std::mem::size_of::<WsConfigAbi>(), 3008);
+        assert_eq!(std::mem::align_of::<WsConfigAbi>(), 4);
     }
 
     #[test]
@@ -864,5 +947,42 @@ mod tests {
 
         assert!(loaded, "LoadRom retornou false para {rom_path}");
         assert!(running_after_load, "Game Gear não iniciou após LoadRom");
+    }
+
+    #[test]
+    fn test_mesen_load_ws_rom() {
+        let rom_path = match std::env::var("MESEN_WS_TEST_ROM") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return,
+        };
+
+        let home = CString::new("/tmp/mesen_home").unwrap();
+        unsafe {
+            InitializeEmu(
+                home.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                false,
+                true,
+                true,
+                true,
+            );
+            InitDll();
+        }
+
+        connect_ws_controllers();
+        let loaded = load_rom(&rom_path, None).expect("caminho com byte nulo");
+        let running_after_load = is_running();
+
+        if running_after_load {
+            stop_emu();
+        }
+
+        unsafe {
+            Release();
+        }
+
+        assert!(loaded, "LoadRom retornou false para {rom_path}");
+        assert!(running_after_load, "WonderSwan não iniciou após LoadRom");
     }
 }
