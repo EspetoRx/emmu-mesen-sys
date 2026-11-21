@@ -4,6 +4,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod pce_palette;
+
 pub const NOTIFICATION_PPU_FRAME_DONE: c_int = 7;
 /// `SoftwareRenderer::Render()` envia um `SoftwareRendererFrame` com buffer
 /// ARGB pronto (o `PpuFrameDone` do SNES não passa o buffer como parâmetro).
@@ -176,6 +178,9 @@ pub const PCE_CHANNEL_COUNT: usize = 6;
 pub const PCE_CD_AUDIO_VOLUME_OFFSET: usize = 6004;
 pub const PCE_ADPCM_VOLUME_OFFSET: usize = 6008;
 pub const PCE_USE_HUC6280A_AUDIO_OFFSET: usize = 6012;
+/// `offsetof(PcEngineConfig, Palette)`. A paleta ocupa os últimos 512 u32 da
+/// estrutura (6036 + 2048 = 8084).
+pub const PCE_PALETTE_OFFSET: usize = 6036;
 
 /// Parâmetro de `ExecuteShortcut` — `EmulatorShortcut::Reset` na ABI do MesenCE.
 #[repr(C)]
@@ -546,6 +551,13 @@ pub fn connect_pce_controllers() {
         config.bytes[offset..offset + 4].copy_from_slice(&volume);
     }
     config.bytes[PCE_USE_HUC6280A_AUDIO_OFFSET] = 1;
+
+    // Sem isto o `PceDefaultVideoFilter` usa uma paleta zerada e todos os
+    // pixels da tela ficam pretos, mesmo com a emulação funcionando.
+    for (index, color) in pce_palette::PCE_DEFAULT_PALETTE.iter().enumerate() {
+        let offset = PCE_PALETTE_OFFSET + index * 4;
+        config.bytes[offset..offset + 4].copy_from_slice(&color.to_le_bytes());
+    }
 
     unsafe { SetPcEngineConfig(config) };
 }
