@@ -106,6 +106,9 @@ ln -sfn "../runtime/$CORE_FILE" "$LINK_OUT/lib$CORE_FILE"
 
 # Faz o dlopen() de nome curto dentro do Mesen resolver a cópia empacotada.
 if [[ "$PLATFORM" == "macos" ]]; then
+  # O install name precisa ser @rpath: com o nome simples "MesenCore.dylib" o
+  # dyld ignora o LC_RPATH do executável e o app recém-instalado não abre.
+  install_name_tool -id "@rpath/$CORE_FILE" "$OUT/$CORE_FILE"
   install_name_tool -delete_rpath @loader_path "$OUT/$CORE_FILE" 2>/dev/null || true
   install_name_tool -add_rpath @loader_path "$OUT/$CORE_FILE"
 elif command -v patchelf >/dev/null 2>&1; then
